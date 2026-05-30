@@ -55,19 +55,31 @@ endif()
 # Set HIP architectures
 set(CMAKE_HIP_ARCHITECTURES ${AMDGPU_TARGETS})
 
-# FP8 macro selection
-# Always define HIP_FP8_TYPE_FNUZ=1 (for gfx942 and host compilation)
-# Additionally define HIP_FP8_TYPE_E4M3=1 when building for gfx950
-# The existing utils.h logic will pick the right one based on architecture
-set(SGL_FP8_MACROS "-DHIP_FP8_TYPE_FNUZ=1")
+# Detect RDNA vs CDNA
+set(SGL_IS_RDNA FALSE)
+if(AMDGPU_TARGETS MATCHES "gfx1[12]")
+  set(SGL_IS_RDNA TRUE)
+  message(STATUS "RDNA target detected: ${AMDGPU_TARGETS} (experimental)")
+endif()
 
-if(AMDGPU_TARGETS MATCHES "gfx950")
+# FP8 macro selection
+set(SGL_FP8_MACROS "")
+set(SGL_ENABLE_FP8 TRUE)
+
+if(AMDGPU_TARGETS MATCHES "gfx942")
+  list(APPEND SGL_FP8_MACROS "-DHIP_FP8_TYPE_FNUZ=1")
+  message(STATUS "Enabling HIP_FP8_TYPE_FNUZ for gfx942")
+endif()
+if(AMDGPU_TARGETS MATCHES "gfx950|gfx12")
   list(APPEND SGL_FP8_MACROS "-DHIP_FP8_TYPE_E4M3=1")
-  message(STATUS "Multi-arch build: Enabling both HIP_FP8_TYPE_FNUZ (gfx942) and HIP_FP8_TYPE_E4M3 (gfx950)")
-elseif(AMDGPU_TARGETS MATCHES "gfx942")
-  message(STATUS "Single-arch build: Enabling HIP_FP8_TYPE_FNUZ for gfx942")
-else()
-  message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'. Expected 'gfx942' or 'gfx950' or both.")
+  message(STATUS "Enabling HIP_FP8_TYPE_E4M3 for ${AMDGPU_TARGETS}")
+endif()
+if(AMDGPU_TARGETS MATCHES "gfx11")
+  set(SGL_ENABLE_FP8 FALSE)
+  message(STATUS "FP8 disabled for ${AMDGPU_TARGETS} (no native FP8)")
+endif()
+if(NOT SGL_FP8_MACROS AND NOT SGL_IS_RDNA)
+  message(FATAL_ERROR "Unsupported AMDGPU_TARGET '${AMDGPU_TARGETS}'.")
 endif()
 
 # TopK dynamic smem bytes
@@ -100,7 +112,6 @@ link_directories(${PLAT_LIB_DIR})
 set(SOURCES
 ${PROJ_ROOT}/csrc/allreduce/custom_all_reduce.hip
 ${PROJ_ROOT}/csrc/allreduce/deterministic_all_reduce.hip
-${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip
 ${PROJ_ROOT}/csrc/common_extension_rocm.cc
 ${PROJ_ROOT}/csrc/elementwise/activation.hip
 ${PROJ_ROOT}/csrc/elementwise/pos_enc.hip
@@ -113,6 +124,12 @@ ${PROJ_ROOT}/csrc/moe/moe_topk_softmax_kernels.hip
 ${PROJ_ROOT}/csrc/moe/moe_topk_sigmoid_kernels.hip
 ${PROJ_ROOT}/csrc/speculative/eagle_utils.hip
 )
+
+if(NOT SGL_IS_RDNA)
+  list(APPEND SOURCES ${PROJ_ROOT}/csrc/allreduce/quick_all_reduce.hip)
+else()
+  list(APPEND SOURCES ${PROJ_ROOT}/csrc/allreduce/quick_all_reduce_stub.cc)
+endif()
 set_source_files_properties(
   ${SOURCES}
   PROPERTIES
@@ -128,12 +145,18 @@ set(SGL_HIP_FLAGS
   -O3
   -std=c++17
   -DENABLE_BF16
-  -DENABLE_FP8
-  ${SGL_FP8_MACROS}
   -Wno-pass-failed
   -Wundefined-internal
   ${SGL_TOPK_MACROS}
 )
+
+if(SGL_ENABLE_FP8)
+  list(APPEND SGL_HIP_FLAGS -DENABLE_FP8 ${SGL_FP8_MACROS})
+endif()
+
+if(SGL_IS_RDNA)
+  list(APPEND SGL_HIP_FLAGS -DSGL_IS_RDNA)
+endif()
 
 # Python extension
 Python_add_library(common_ops MODULE USE_SABI ${SKBUILD_SABI_VERSION} WITH_SOABI ${SOURCES})

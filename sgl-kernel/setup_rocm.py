@@ -40,10 +40,40 @@ include_dirs = [
     root / "csrc",
 ]
 
+cxx_flags = ["-O3"]
+libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
+extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
+
+CDNA_TARGETS = {"gfx942", "gfx950"}
+RDNA_TARGETS = {"gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"}
+ALL_TARGETS = CDNA_TARGETS | RDNA_TARGETS
+
+RDNA_FP8_TARGETS = {"gfx1200", "gfx1201"}
+
+default_target = "gfx942"
+amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
+
+if torch.cuda.is_available():
+    try:
+        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
+    except Exception as e:
+        print(f"Warning: Failed to detect GPU properties: {e}")
+else:
+    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+
+if amdgpu_target not in ALL_TARGETS:
+    print(
+        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. "
+        f"Supported: {sorted(ALL_TARGETS)}"
+    )
+    sys.exit(1)
+
+is_rdna = amdgpu_target in RDNA_TARGETS
+has_fp8 = amdgpu_target in CDNA_TARGETS or amdgpu_target in RDNA_FP8_TARGETS
+
 sources = [
     "csrc/allreduce/custom_all_reduce.hip",
     "csrc/allreduce/deterministic_all_reduce.hip",
-    "csrc/allreduce/quick_all_reduce.cu",
     "csrc/common_extension_rocm.cc",
     "csrc/elementwise/activation.cu",
     "csrc/elementwise/deepseek_v4_topk.cu",
@@ -59,36 +89,29 @@ sources = [
     "csrc/elementwise/pos_enc.cu",
 ]
 
-cxx_flags = ["-O3"]
-libraries = ["hiprtc", "amdhip64", "c10", "torch", "torch_python"]
-extra_link_args = ["-Wl,-rpath,$ORIGIN/../../torch/lib", f"-L/usr/lib/{arch}-linux-gnu"]
-
-default_target = "gfx942"
-amdgpu_target = os.environ.get("AMDGPU_TARGET", default_target)
-
-if torch.cuda.is_available():
-    try:
-        amdgpu_target = torch.cuda.get_device_properties(0).gcnArchName.split(":")[0]
-    except Exception as e:
-        print(f"Warning: Failed to detect GPU properties: {e}")
+if is_rdna:
+    sources.append("csrc/allreduce/quick_all_reduce_stub.cc")
 else:
-    print(f"Warning: torch.cuda not available. Using default target: {amdgpu_target}")
+    sources.append("csrc/allreduce/quick_all_reduce.cu")
 
-if amdgpu_target not in ["gfx942", "gfx950"]:
-    print(
-        f"Warning: Unsupported GPU architecture detected '{amdgpu_target}'. Expected 'gfx942' or 'gfx950'."
-    )
-    sys.exit(1)
+if amdgpu_target == "gfx942":
+    fp8_macro = "-DHIP_FP8_TYPE_FNUZ"
+elif has_fp8:
+    fp8_macro = "-DHIP_FP8_TYPE_E4M3"
+else:
+    fp8_macro = None
 
-fp8_macro = (
-    "-DHIP_FP8_TYPE_FNUZ" if amdgpu_target == "gfx942" else "-DHIP_FP8_TYPE_E4M3"
-)
+if is_rdna:
+    print(f"Note: Building for RDNA target {amdgpu_target} (experimental)")
+    if not has_fp8:
+        print(f"Note: FP8 disabled for {amdgpu_target} (no native FP8 support)")
 
-# Dynamic shared-memory budget for the TopK kernels.
-# - gfx942 (MI300/MI325): LDS is typically 64KB per workgroup -> keep dynamic smem <= ~48KB
-#   (leaves room for static shared allocations in the kernel).
-# - gfx95x (MI350): LDS is larger (e.g. 160KB per CU) -> allow the original 128KB dynamic smem.
-topk_dynamic_smem_bytes = 48 * 1024 if amdgpu_target == "gfx942" else 32 * 1024 * 4
+# gfx942: 64KB LDS -> 48KB dynamic, gfx95x: 160KB LDS -> 128KB dynamic
+# RDNA3/4 (gfx11xx/gfx12xx): 64KB LDS per WGP -> 48KB (matches gfx942 budget)
+if amdgpu_target.startswith("gfx95"):
+    topk_dynamic_smem_bytes = 32 * 1024 * 4
+else:
+    topk_dynamic_smem_bytes = 48 * 1024
 
 hipcc_flags = [
     "-DNDEBUG",
@@ -99,10 +122,19 @@ hipcc_flags = [
     "-std=c++17",
     f"--amdgpu-target={amdgpu_target}",
     "-DENABLE_BF16",
-    "-DENABLE_FP8",
-    fp8_macro,
     f"-DSGL_TOPK_DYNAMIC_SMEM_BYTES={topk_dynamic_smem_bytes}",
 ]
+
+if has_fp8:
+    hipcc_flags.extend(["-DENABLE_FP8", fp8_macro])
+
+if is_rdna:
+    hipcc_flags.append("-DSGL_IS_RDNA")
+    cxx_flags.append("-DSGL_IS_RDNA")
+
+_rocm_warp = 64 if not is_rdna else 32
+hipcc_flags.append(f"-DSGL_ROCM_WARP_SIZE={_rocm_warp}")
+cxx_flags.append(f"-DSGL_ROCM_WARP_SIZE={_rocm_warp}")
 
 ext_modules = [
     CUDAExtension(
