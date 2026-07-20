@@ -63,6 +63,7 @@ from sglang.srt.utils import (
     is_hip,
     is_mps,
     is_npu,
+    is_triton_kernels_available,
     mxfp_supported,
 )
 
@@ -106,7 +107,11 @@ BASE_QUANTIZATION_METHODS: Dict[str, Type[QuantizationConfig]] = {
 }
 
 
-if is_cpu() or is_cuda() or (_is_mxfp_supported and is_hip()):
+if is_cpu() or is_cuda() or (
+    is_hip() and (_is_mxfp_supported or is_triton_kernels_available())
+):
+    # RDNA (gfx11xx/gfx12xx) has no gfx95 MX hardware, but can still run MXFP4
+    # MoE through the OpenAI triton_kernels path (matches vLLM's ROCm route).
     BASE_QUANTIZATION_METHODS.update(
         {
             "mxfp4": Mxfp4Config,
