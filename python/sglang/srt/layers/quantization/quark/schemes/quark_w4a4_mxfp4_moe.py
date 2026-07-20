@@ -36,7 +36,10 @@ if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
     from aiter.utility.fp4_utils import e8m0_shuffle
 
-if _is_hip:
+# aiter is opt-in (SGLANG_USE_AITER); gate the import so a no-aiter startup works.
+# Unlike the linear MXFP4 scheme, MoE MXFP4 has a non-aiter fallback (the OpenAI
+# triton_kernels path), so leave the symbol None rather than hard-failing.
+if _use_aiter:
     from aiter.ops.triton.quant import dynamic_mxfp4_quant
 else:
     dynamic_mxfp4_quant = None

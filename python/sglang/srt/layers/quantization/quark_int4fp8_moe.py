@@ -18,17 +18,21 @@ from sglang.srt.layers.quantization.base_config import (
 )
 from sglang.srt.layers.quantization.fp8 import Fp8LinearMethod
 from sglang.srt.runtime_context import get_parallel
-from sglang.srt.utils import BAR_FORMAT, is_hip, set_weight_attrs
+from sglang.srt.utils import BAR_FORMAT, get_bool_env_var, is_hip, set_weight_attrs
 
 if TYPE_CHECKING:
     from sglang.srt.layers.moe.token_dispatcher import DispatchOutput
 
 _is_hip = is_hip()
+# aiter is opt-in (SGLANG_USE_AITER, default off); import only when requested so a
+# default RDNA/no-aiter startup does not crash. Fail loudly if requested but broken.
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 
-
-if _is_hip:
+if _use_aiter:
     from aiter.ops.shuffle import shuffle_weight
 
+# ON_GFX950 is an arch probe unrelated to aiter, so keep it under is_hip().
+if _is_hip:
     ON_GFX950 = "gfx950" in torch.cuda.get_device_properties("cuda").gcnArchName
 
 logger = logging.getLogger(__name__)
@@ -143,6 +147,13 @@ class QuarkInt4Fp8MoEMethod(FusedMoEMethodBase):
         if not _is_hip:
             raise NotImplementedError(
                 "The quark_int4fp8_moe online quantization scheme is only supported on AMD GPUs."
+            )
+        # aiter-backed and no non-aiter fallback: fail clearly instead of a later
+        # NameError when shuffle_weight was not imported.
+        if not _use_aiter:
+            raise NotImplementedError(
+                "The quark_int4fp8_moe scheme requires aiter. Set SGLANG_USE_AITER=1 "
+                "and install a compatible aiter on your AMD device."
             )
 
     def get_weight_loader(self, layer, original_weight_loader):

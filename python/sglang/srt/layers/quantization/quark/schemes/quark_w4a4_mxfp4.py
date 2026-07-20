@@ -7,11 +7,17 @@ import torch
 
 from sglang.srt.layers.parameter import GroupQuantScaleParameter, PackedvLLMParameter
 from sglang.srt.layers.quantization.quark.schemes import QuarkLinearScheme
-from sglang.srt.utils import is_hip
+from sglang.srt.utils import get_bool_env_var, is_hip
 from sglang.srt.utils.common import direct_register_custom_op, mxfp_supported
 
 _is_hip = is_hip()
-if _is_hip:
+# aiter is opt-in (SGLANG_USE_AITER, default off) and is not a hard dependency, so
+# is_hip() alone must not trigger the import -- a default RDNA/no-aiter startup would
+# otherwise crash importing this module. Import only when aiter is explicitly
+# requested; if it is requested but not importable, fail loudly here rather than
+# silently degrading (the user asked for aiter).
+_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
+if _use_aiter:
     from aiter.ops.triton.gemm.fused.fused_gemm_afp4wfp4_split_cat import (
         fused_gemm_afp4wfp4_split_cat as _fused_gemm_afp4wfp4_split_cat_orig,
     )
@@ -168,6 +174,14 @@ class QuarkW4A4MXFP4(QuarkLinearScheme):
         self.weight_quant_spec = weight_quant_spec
         self.input_quant_spec = input_quant_spec
         self.is_checkpoint_mxfp4_serialized = is_checkpoint_mxfp4_serialized
+
+        # This scheme is aiter-backed; without aiter the module-level kernels above
+        # are not defined. Fail clearly here instead of a later NameError.
+        if not _use_aiter:
+            raise NotImplementedError(
+                "The Quark W4A4 MXFP4 scheme requires aiter. Set SGLANG_USE_AITER=1 "
+                "and install a compatible aiter on your AMD device."
+            )
 
         if not self.is_checkpoint_mxfp4_serialized:
             if not mxfp_supported():
